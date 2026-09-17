@@ -1,206 +1,363 @@
 /*
-  TinyML Keyword Spotting -- ESP32 benchmarking firmware
-  ========================================================
+  TinyML Keyword Spotting -- ESP32 benchmark firmware
+  ====================================================
 
-  This sketch loads ONE model variant at a time (chosen below by which
-  header you #include and which byte array you point kModelData at),
-  runs inference on a fixed set of test samples, and prints per-sample
-  latency plus tensor arena (RAM) usage over Serial.
+  Chirale_TensorFlowLite version
 
-  To benchmark all four variants: change the MODEL_VARIANT define below,
-  reflash, and record the printed results. Repeat for each variant.
-  Keeping everything else identical is what makes the comparison fair.
+  This sketch benchmarks the four INT8 model variants exported by the
+  Google Colab pipeline:
 
-  REQUIRED LIBRARY:
-    Install "esp-tflite-micro" via Arduino Library Manager
-    (Espressif's actively-maintained TFLite Micro port for ESP32).
-    Board package: esp32 by Espressif Systems (Boards Manager).
+    0 = baseline INT8
+    1 = post-training quantized INT8
+    2 = pruned + INT8
+    3 = architecture-optimized + INT8
 
-  WIRING: none required for this benchmarking sketch -- it runs on
-  pre-recorded test samples baked into flash (test_samples.h), so no
-  microphone is needed yet.
+  The benchmark uses the 10 real Speech Commands test samples stored in
+  test_samples.h. No microphone is required.
+
+  For a fair comparison, change MODEL_VARIANT, upload, run once, and
+  record the printed accuracy, latency, tensor-arena usage, and model size.
+
+  Required Arduino library:
+    Chirale_TensorFlowLite by Spazio Chirale
+
+  Board:
+    ESP32 Dev Module
 */
 
-#include <TensorFlowLite_ESP32.h>
+#include <Arduino.h>
+#include <math.h>
+#include <limits.h>
+
+// Chirale's Arduino port of TensorFlow Lite Micro.
+#include <Chirale_TensorFlowLite.h>
+
+// TFLite Micro headers used by the Chirale examples/API.
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
-#include "tensorflow/lite/micro/micro_error_reporter.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
-// ---------------------------------------------------------------------
-// STEP 1: pick which variant to benchmark by uncommenting ONE line below.
-// Only one at a time -- flash, run, record results, then swap.
-// ---------------------------------------------------------------------
-#include "model_baseline.h"
-// #include "model_quantized.h"
-// #include "model_pruned.h"
-// #include "model_arch_optimized.h"
-// #include "model_baseline_float32.h"   // NOTE: float32 model needs a much
-                                          // larger tensor arena below, and a
-                                          // different ops resolver setup --
-                                          // see comment near kTensorArenaSize.
+// ============================================================
+// MODEL SELECTION
+// ============================================================
+// Change ONLY this number, then Verify -> Upload for each model.
+//   0 = baseline INT8
+//   1 = quantized INT8
+//   2 = pruned INT8
+//   3 = architecture-optimized INT8
+#define MODEL_VARIANT 3
+
+#if MODEL_VARIANT == 0
+  #include "model_baseline.h"
+  #define MODEL_DATA g_baseline_model
+  #define MODEL_DATA_LEN g_baseline_model_len
+  const char* MODEL_NAME = "Baseline INT8";
+#elif MODEL_VARIANT == 1
+  #include "model_quantized.h"
+  #define MODEL_DATA g_quantized_model
+  #define MODEL_DATA_LEN g_quantized_model_len
+  const char* MODEL_NAME = "Quantized INT8";
+#elif MODEL_VARIANT == 2
+  #include "model_pruned.h"
+  #define MODEL_DATA g_pruned_model
+  #define MODEL_DATA_LEN g_pruned_model_len
+  const char* MODEL_NAME = "Pruned INT8";
+#elif MODEL_VARIANT == 3
+  #include "model_arch_optimized.h"
+  #define MODEL_DATA g_arch_optimized_model
+  #define MODEL_DATA_LEN g_arch_optimized_model_len
+  const char* MODEL_NAME = "Architecture-optimized INT8";
+#else
+  #error "MODEL_VARIANT must be 0, 1, 2, or 3"
+#endif
 
 #include "test_samples.h"
 
-// Match this to whichever #include you enabled above.
-#define MODEL_DATA g_baseline_model
-#define MODEL_DATA_LEN g_baseline_model_len
-
-// ---------------------------------------------------------------------
-// STEP 2: tensor arena -- the scratch RAM TFLM uses for activations.
-// Start conservative and increase if AllocateTensors() fails; this
-// final chosen value IS one of your benchmark numbers (RAM usage).
-// ---------------------------------------------------------------------
-constexpr int kTensorArenaSize = 60 * 1024;   // 60 KB, typical starting point
-                                                // for a small DS-CNN at INT8
+// ============================================================
+// TENSOR ARENA
+// ============================================================
+// This is the scratch RAM available to TensorFlow Lite Micro.
+// The actual requirement is reported with arena_used_bytes().
+// 100 KB gives enough headroom while keeping the ESP32 well within
+// its internal RAM capacity for this small keyword-spotting model.
+constexpr size_t kTensorArenaSize = 80 * 1024;
 alignas(16) uint8_t tensor_arena[kTensorArenaSize];
 
-namespace {
-tflite::MicroErrorReporter micro_error_reporter;
-tflite::ErrorReporter* error_reporter = &micro_error_reporter;
+// ============================================================
+// TFLITE GLOBALS
+// ============================================================
 const tflite::Model* model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
 TfLiteTensor* output = nullptr;
-}  // namespace
 
+// ============================================================
+// SETUP
+// ============================================================
 void setup() {
   Serial.begin(115200);
-  delay(2000);
-  Serial.println("=== TinyML KWS ESP32 Benchmark ===");
+  delay(1500);
 
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println(" TinyML KWS - ESP32 Benchmark");
+  Serial.println("========================================");
+  Serial.print("Model: ");
+  Serial.println(MODEL_NAME);
+  Serial.print("Model variant: ");
+  Serial.println(MODEL_VARIANT);
+  Serial.print("Model bytes: ");
+  Serial.println(MODEL_DATA_LEN);
+  Serial.println();
+
+  // Load the FlatBuffer model directly from flash.
   model = tflite::GetModel(MODEL_DATA);
-  if (model->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.println("ERROR: model schema version mismatch");
+
+  if (model == nullptr) {
+    Serial.println("ERROR: Could not load model.");
     return;
   }
 
-  // Op resolver: list every op your model actually uses. Keeping this
-  // minimal (rather than using AllOpsResolver) saves flash -- worth
-  // reporting as part of your flash-size comparison.
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.print("ERROR: Model schema version = ");
+    Serial.print(model->version());
+    Serial.print(", library schema version = ");
+    Serial.println(TFLITE_SCHEMA_VERSION);
+    return;
+  }
+
+  // Register only the operators used by the DS-CNN model.
+  // This avoids the large flash overhead of AllOpsResolver.
   static tflite::MicroMutableOpResolver<8> resolver;
   resolver.AddConv2D();
   resolver.AddDepthwiseConv2D();
   resolver.AddFullyConnected();
   resolver.AddSoftmax();
   resolver.AddRelu();
-  resolver.AddMean();          // used by GlobalAveragePooling2D
+  resolver.AddMean();
   resolver.AddReshape();
   resolver.AddQuantize();
 
+  // Chirale's example uses this four-argument MicroInterpreter form.
   static tflite::MicroInterpreter static_interpreter(
-      model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
+      model, resolver, tensor_arena, kTensorArenaSize);
   interpreter = &static_interpreter;
 
   TfLiteStatus allocate_status = interpreter->AllocateTensors();
+
   if (allocate_status != kTfLiteOk) {
-    Serial.println("ERROR: AllocateTensors() failed -- increase kTensorArenaSize");
+    Serial.println("ERROR: AllocateTensors() failed.");
+    Serial.println("Try increasing kTensorArenaSize.");
     return;
   }
 
   input = interpreter->input(0);
   output = interpreter->output(0);
 
-  size_t used_bytes = interpreter->arena_used_bytes();
-  Serial.print("Tensor arena used: ");
-  Serial.print(used_bytes);
-  Serial.println(" bytes  <-- this is your RAM benchmark number");
+  if (input == nullptr || output == nullptr) {
+    Serial.println("ERROR: Input/output tensor is null.");
+    return;
+  }
 
-  Serial.print("Model size (flash): ");
+  Serial.println("TensorFlow Lite Micro initialization: OK");
+
+  // Actual tensor-arena memory used by this model.
+  size_t arena_used = interpreter->arena_used_bytes();
+  Serial.print("Tensor arena used (RAM): ");
+  Serial.print(arena_used);
+  Serial.println(" bytes");
+
+  // Size of the model FlatBuffer stored in the generated .h file.
+  Serial.print("Model binary size (flash): ");
   Serial.print(MODEL_DATA_LEN);
-  Serial.println(" bytes  <-- this is your flash/model-size benchmark number");
+  Serial.println(" bytes");
 
-  run_benchmark();
+  Serial.print("Input type: ");
+  Serial.println(input->type);
+  Serial.print("Input scale: ");
+  Serial.println(input->params.scale, 8);
+  Serial.print("Input zero point: ");
+  Serial.println(input->params.zero_point);
+
+  Serial.print("Output type: ");
+  Serial.println(output->type);
+  Serial.print("Output scale: ");
+  Serial.println(output->params.scale, 8);
+  Serial.print("Output zero point: ");
+  Serial.println(output->params.zero_point);
+
+  Serial.println();
+  Serial.println("Running 10 fixed Speech Commands test samples...");
+  Serial.println();
+
+  runBenchmark();
 }
 
-void run_benchmark() {
+// ============================================================
+// BENCHMARK
+// ============================================================
+void runBenchmark() {
   int correct = 0;
   unsigned long total_us = 0;
   unsigned long min_us = ULONG_MAX;
   unsigned long max_us = 0;
+
+  // One timing value for every sample so standard deviation can be computed.
   unsigned long timings[NUM_TEST_SAMPLES];
+  bool timing_valid[NUM_TEST_SAMPLES];
 
-  float in_scale = input->params.scale;
-  int in_zero_point = input->params.zero_point;
-  float out_scale = output->params.scale;
-  int out_zero_point = output->params.zero_point;
+  for (int i = 0; i < NUM_TEST_SAMPLES; ++i) {
+    timing_valid[i] = false;
+  }
 
-  for (int i = 0; i < NUM_TEST_SAMPLES; i++) {
-    // Quantize this sample using THIS model's own scale/zero-point --
-    // necessary because each variant gets its own quantization params
-    // from the converter.
-    for (int j = 0; j < FEATURE_SIZE; j++) {
-      float v = g_test_samples[i][j];
-      int32_t q = (int32_t)round(v / in_scale) + in_zero_point;
+  // The exported samples are float32 MFCCs. Every model deployed for the
+  // main comparison is fully INT8, so quantize using that model's own
+  // input scale and zero point.
+  const float input_scale = input->params.scale;
+  const int input_zero_point = input->params.zero_point;
+  const float output_scale = output->params.scale;
+  const int output_zero_point = output->params.zero_point;
+
+  if (input_scale == 0.0f) {
+    Serial.println("ERROR: Input quantization scale is zero.");
+    return;
+  }
+
+  for (int i = 0; i < NUM_TEST_SAMPLES; ++i) {
+    // ----------------------------------------------------------
+    // Copy + quantize one MFCC sample into the model input tensor.
+    // ----------------------------------------------------------
+    for (int j = 0; j < FEATURE_SIZE; ++j) {
+      float value = g_test_samples[i][j];
+      int32_t q = (int32_t)roundf(value / input_scale)
+                  + input_zero_point;
+
       if (q < -128) q = -128;
       if (q > 127) q = 127;
+
       input->data.int8[j] = (int8_t)q;
     }
 
+    // ----------------------------------------------------------
+    // Time ONLY the neural-network Invoke() call.
+    // Input quantization and serial printing are excluded.
+    // ----------------------------------------------------------
     unsigned long start_us = micros();
     TfLiteStatus invoke_status = interpreter->Invoke();
     unsigned long elapsed_us = micros() - start_us;
 
     if (invoke_status != kTfLiteOk) {
-      Serial.println("ERROR: Invoke() failed");
+      Serial.print("Sample ");
+      Serial.print(i);
+      Serial.println(": ERROR - Invoke() failed");
       continue;
     }
 
     timings[i] = elapsed_us;
+    timing_valid[i] = true;
     total_us += elapsed_us;
+
     if (elapsed_us < min_us) min_us = elapsed_us;
     if (elapsed_us > max_us) max_us = elapsed_us;
 
-    // dequantize output, find argmax
+    // ----------------------------------------------------------
+    // Argmax over the 10 INT8 output classes.
+    // ----------------------------------------------------------
     int best_idx = 0;
-    float best_val = -1e9;
-    for (int c = 0; c < 10; c++) {
-      float val = (output->data.int8[c] - out_zero_point) * out_scale;
-      if (val > best_val) {
-        best_val = val;
+    int8_t best_raw = output->data.int8[0];
+
+    for (int c = 1; c < 10; ++c) {
+      if (output->data.int8[c] > best_raw) {
+        best_raw = output->data.int8[c];
         best_idx = c;
       }
     }
+
+    // Dequantize only for reporting; argmax itself is unchanged by
+    // the common positive output scale.
+    float best_score =
+        (best_raw - output_zero_point) * output_scale;
 
     bool is_correct = (best_idx == g_test_labels[i]);
     if (is_correct) correct++;
 
     Serial.print("Sample ");
     Serial.print(i);
-    Serial.print(": predicted=");
+    Serial.print(" | predicted=");
     Serial.print(kCategoryLabels[best_idx]);
-    Serial.print(" true=");
+    Serial.print(" | true=");
     Serial.print(kCategoryLabels[g_test_labels[i]]);
-    Serial.print(" latency_us=");
-    Serial.println(elapsed_us);
+    Serial.print(" | score=");
+    Serial.print(best_score, 5);
+    Serial.print(" | latency_us=");
+    Serial.print(elapsed_us);
+    Serial.print(" | ");
+    Serial.println(is_correct ? "CORRECT" : "WRONG");
   }
 
-  float mean_us = (float)total_us / NUM_TEST_SAMPLES;
-
-  // standard deviation
-  float sq_sum = 0;
-  for (int i = 0; i < NUM_TEST_SAMPLES; i++) {
-    float diff = timings[i] - mean_us;
-    sq_sum += diff * diff;
+  // ------------------------------------------------------------
+  // Calculate summary statistics using only successful invokes.
+  // ------------------------------------------------------------
+  int valid_count = 0;
+  for (int i = 0; i < NUM_TEST_SAMPLES; ++i) {
+    if (timing_valid[i]) valid_count++;
   }
-  float stddev_us = sqrt(sq_sum / NUM_TEST_SAMPLES);
 
-  Serial.println("\n=== Benchmark summary ===");
-  Serial.print("Accuracy on test samples: ");
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println(" BENCHMARK SUMMARY");
+  Serial.println("========================================");
+
+  Serial.print("Model: ");
+  Serial.println(MODEL_NAME);
+
+  Serial.print("Test accuracy: ");
   Serial.print(correct);
   Serial.print("/");
-  Serial.println(NUM_TEST_SAMPLES);
-  Serial.print("Mean latency (us): ");
-  Serial.println(mean_us);
-  Serial.print("Min latency (us): ");
-  Serial.println(min_us);
-  Serial.print("Max latency (us): ");
-  Serial.println(max_us);
-  Serial.print("Stddev latency (us): ");
-  Serial.println(stddev_us);
+  Serial.print(NUM_TEST_SAMPLES);
+  Serial.print(" = ");
+  Serial.print(100.0f * correct / NUM_TEST_SAMPLES, 2);
+  Serial.println("%");
+
+  if (valid_count > 0) {
+    float mean_us = (float)total_us / valid_count;
+
+    float sq_sum = 0.0f;
+    for (int i = 0; i < NUM_TEST_SAMPLES; ++i) {
+      if (!timing_valid[i]) continue;
+      float diff = (float)timings[i] - mean_us;
+      sq_sum += diff * diff;
+    }
+    float stddev_us = sqrtf(sq_sum / valid_count);
+
+    Serial.print("Mean latency (us): ");
+    Serial.println(mean_us, 2);
+
+    Serial.print("Min latency (us): ");
+    Serial.println(min_us);
+
+    Serial.print("Max latency (us): ");
+    Serial.println(max_us);
+
+    Serial.print("Stddev latency (us): ");
+    Serial.println(stddev_us, 2);
+  } else {
+    Serial.println("No successful inference timings recorded.");
+  }
+
+  Serial.print("Tensor arena used / RAM (bytes): ");
+  Serial.println(interpreter->arena_used_bytes());
+
+  Serial.print("Model binary / model flash (bytes): ");
+  Serial.println(MODEL_DATA_LEN);
+
+  Serial.println("========================================");
+  Serial.println("Benchmark finished.");
+  Serial.println("========================================");
 }
 
 void loop() {
-  // benchmark runs once in setup(); nothing to repeat here
-  delay(10000);
+  // Run once after boot. The same flashed firmware should not rerun the
+  // benchmark automatically because repeated runs would complicate logging.
+  delay(1000);
 }
