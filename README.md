@@ -14,7 +14,7 @@ We benchmark three compression techniques, alone and in combination, on a depthw
 | NAS | Budget-constrained grid search over filters (8–24) × blocks (2–4), budget = 50 % of baseline parameters |
 
 Evaluated variants: baseline, pruned, NAS, NAS + pruned — each in FP32 and INT8.
-
+the features.npz can be found in https://drive.google.com/drive/folders/1BMxPLaFmkS1fgYz3ZnBhnX4DNtkNPfxi?usp=sharing
 ---
 
 ## 1. Dataset
