@@ -105,7 +105,6 @@ Full numbers: `combined_results_summary.csv` and `esp32_serial_log.csv`.
 - Pruning is unstructured, with about 40 % measured sparsity rather than the 50 % target.
 - No energy measurements yet.
 - Noisy-audio robustness scripts are included but results are not yet validated.
-- One dataset (Speech Commands v0.02) and one microcontroller.
 
 ## 6. Licence and citation
 
