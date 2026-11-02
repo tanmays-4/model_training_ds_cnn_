@@ -1,0 +1,6 @@
+﻿"model,accuracy,mean_latency_us,p95_latency_us,max_latency_us,arena_used_bytes,model_flash_bytes"
+"baseline_fp32,0.9400,410919.5,410998,411279,82672,30440"
+"baseline_int8,0.9400,74184.1,74286,74458,24532,20864"
+"pruned_int8,0.8800,74202.6,74308,74435,24532,20864"
+"nas_v2_int8,0.6400,34909.0,34981,35132,15476,12640"
+"nas_v2_pruned_int8,0.7200,34877.1,34963,35118,15476,12640"
